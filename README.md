@@ -5,5 +5,4 @@ This repo contains all the working code files for the project as well as depraca
 2. The working directory for the ESP32-S3-CAM is `CameraWebServer_New`. To prevent confusion all the code files in the depracted directory would be appended with .old
 3. Use the depracated code files as inspiration for the new one
 4. The directory `Arduino_code` contains the code file the Arduino uses to read data from the DHT11 and PIR motion sensor
-
-To make changes
+5. The code files in the root directory are used for intercepting the video stream and running human detection
