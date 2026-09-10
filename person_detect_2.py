@@ -33,6 +33,9 @@ import cv2
 import numpy as np
 import requests
 from ultralytics import YOLO
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- Configuration ---------------------------------------------------
 
@@ -57,8 +60,8 @@ CONFIDENCE_THRESHOLD = 0.5
 
 _last_alert_time = 0.0
 
-TELEGRAM_BOT_TOKEN = "8608701032:AAEmf64VsY8aXHrEfft1anJpzWJ2R1mfl4E"
-TELEGRAM_BOT_ID = "8608701032"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", None)
+TELEGRAM_BOT_ID = os.environ.get("TELEGRAM_BOT_ID", None)
 
 
 def make_person_detector():

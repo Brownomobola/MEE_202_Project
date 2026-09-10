@@ -1,0 +1,6 @@
+.env
+*.pt
+*.yml
+*.csv
+*.yml.old
+*.csv.old
