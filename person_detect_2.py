@@ -24,7 +24,10 @@ Usage:
     python person_detection_poll.py
 """
 
+import os
 import time
+import threading
+
 
 import cv2
 import numpy as np
@@ -33,7 +36,7 @@ from ultralytics import YOLO
 
 # --- Configuration ---------------------------------------------------
 
-ESP32_BASE = "http://192.168.137.52"          # ESP32's main IP (port 80 endpoints)
+ESP32_BASE = "http://192.168.137.36"          # ESP32's main IP (port 80 endpoints)
 SENSOR_URL = f"{ESP32_BASE}/sensor"
 CAPTURE_URL = f"{ESP32_BASE}/capture"
 ALERT_URL = f"{ESP32_BASE}/alert"
@@ -54,10 +57,13 @@ CONFIDENCE_THRESHOLD = 0.5
 
 _last_alert_time = 0.0
 
+TELEGRAM_BOT_TOKEN = "8608701032:AAEmf64VsY8aXHrEfft1anJpzWJ2R1mfl4E"
+TELEGRAM_BOT_ID = "8608701032"
+
 
 def make_person_detector():
     model = YOLO("yolo11n.pt")
-    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    dummy = np.zeros((240, 320, 3), dtype=np.uint8)
     model(dummy, verbose=False)  # warm up, so first real timing isn't skewed
     return model
 
@@ -77,13 +83,36 @@ def detect_person(model, frame):
 
     return person_found, frame
 
+def _send_telegram_worker(image_path):
+    """
+    Sends a message to the telegram bot.
+    Runs in the background thread so it is non-blocking
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        with open(image_path, "rb") as image_file:
+            files = {"photo": image_file}
+            data = {"chat_id": TELEGRAM_BOT_ID, "caption": "Alert: Person Detected!"}
+            resp = requests.post(url, data, files=files, timeout=15)
+            resp.raise_for_status()
+        print("Telegram Alert sent successfully")
+    except Exception as e:
+        print(f"Could not send Telegram alert because of error {str(e)}")
 
-def maybe_send_alert():
+def maybe_send_alert(frame):
     global _last_alert_time
     now = time.monotonic()
     if now - _last_alert_time < ALERT_COOLDOWN_SECONDS:
         return
     _last_alert_time = now
+
+    os.makedirs("detections", exist_ok=True)
+    filename = f"detections/intruder_{int(time.time())}.jpg"
+    cv2.imwrite(filename, frame)
+    print(f"Saved the evidence to {filename}")
+
+    threading.Thread(target=_send_telegram_worker, args=(filename,), daemon=True).start()
+
     try:
         requests.get(ALERT_URL, timeout=3)
         print("Alert sent to ESP32.")
@@ -133,12 +162,12 @@ def run_detection_burst(model):
         if found:
             cv2.imshow("Detection", annotated)
             cv2.waitKey(1)
-            return True
+            return (True, annotated)
 
         if i < BURST_FRAME_COUNT - 1:
             time.sleep(BURST_FRAME_DELAY_S)
 
-    return False
+    return (False, None)
 
 
 def main():
@@ -148,8 +177,9 @@ def main():
     while True:
         if poll_motion():
             print("Motion detected -- running burst check...")
-            if run_detection_burst(model):
-                maybe_send_alert()
+            response, frame = run_detection_burst(model)
+            if response:
+                maybe_send_alert(frame)
 
         time.sleep(POLL_INTERVAL_S)
 

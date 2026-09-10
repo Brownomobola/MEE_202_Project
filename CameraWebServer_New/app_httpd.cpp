@@ -22,6 +22,18 @@
 #include "sdkconfig.h"
 #include "camera_index.h"
 #include "board_config.h"
+#include <WiFi.h>
+
+extern float latestTemp;
+extern float latestHumidity;
+
+// Set by /alert (this file) when the Python detection script reports a
+// person; read + auto-cleared by loop() in the .ino for the NeoPixel
+// indicator. Declared there, just referenced here.
+extern volatile bool personAlertActive;
+extern volatile unsigned long personAlertSetAt;
+//Set be the ESP when it receives motion data from the Arduino
+extern volatile bool hardwareMotionDetected;
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -45,6 +57,9 @@ typedef struct {
 static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
+static const char *_MOTION_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\nX-Motion: 1\r\n\r\n";
+
+volatile int MotionFlagFramesRemaining = 0;
 
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
@@ -96,8 +111,6 @@ void enable_led(bool en) {  // Turn LED On or Off
     duty = CONFIG_LED_MAX_INTENSITY;
   }
   ledcWrite(LED_GPIO_NUM, duty);
-  //ledc_set_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL, duty);
-  //ledc_update_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL);
   log_i("Set LED intensity to %d", duty);
 }
 #endif
@@ -120,7 +133,6 @@ static esp_err_t bmp_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
   char ts[32];
-  // Cast to uint32_t is safe until year 2106.
   snprintf(ts, 32, "%" PRIu32 ".%06" PRIu32, (uint32_t)fb->timestamp.tv_sec, (uint32_t)fb->timestamp.tv_usec);
   httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
 
@@ -163,8 +175,8 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 
 #if defined(LED_GPIO_NUM)
   enable_led(true);
-  vTaskDelay(150 / portTICK_PERIOD_MS);  // The LED needs to be turned on ~150ms before the call to esp_camera_fb_get()
-  fb = esp_camera_fb_get();              // or it won't be visible in the frame. A better way to do this is needed.
+  vTaskDelay(150 / portTICK_PERIOD_MS);
+  fb = esp_camera_fb_get();
   enable_led(false);
 #else
   fb = esp_camera_fb_get();
@@ -181,7 +193,6 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
   char ts[32];
-  // Cast to uint32_t is safe until year 2106.
   snprintf(ts, 32, "%" PRIu32 ".%06" PRIu32, (uint32_t)fb->timestamp.tv_sec, (uint32_t)fb->timestamp.tv_usec);
   httpd_resp_set_hdr(req, "X-Timestamp", (const char *)ts);
 
@@ -220,6 +231,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   static int64_t last_frame = 0;
   if (!last_frame) {
     last_frame = esp_timer_get_time();
+  }
+  static int64_t fps_timer = 0;
+  static int frame_count = 0;
+  static size_t total_bytes = 0;
+  if (!fps_timer) {
+    fps_timer = esp_timer_get_time();
   }
 
   res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
@@ -260,7 +277,13 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
     }
     if (res == ESP_OK) {
-      size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
+      bool flagged = (MotionFlagFramesRemaining > 0);
+      if (flagged) MotionFlagFramesRemaining--;
+
+      size_t hlen = flagged
+        ? snprintf((char *)part_buf, 128, _MOTION_STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec)
+        : snprintf((char *)part_buf, 128, _STREAM_PART,        _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
+
       res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
     }
     if (res == ESP_OK) {
@@ -284,6 +307,20 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     last_frame = fr_end;
 
     frame_time /= 1000;
+    frame_count++;
+    total_bytes += _jpg_buf_len;
+    int64_t elapsed = fr_end - fps_timer;
+    if (elapsed >= 1000000) {
+      float fps = frame_count / (elapsed / 1000000.0);
+      float avg_frame_bytes = (float)total_bytes / frame_count;
+      float bits_per_second = fps * avg_frame_bytes * 8;
+      float mbps = bits_per_second / 1000000.0;
+      Serial.printf("FPS: %.2f | Avg frame: %.0f bytes | Required: %.2f Mbps\n", fps, avg_frame_bytes, mbps);
+      Serial.println(ESP.getFreeHeap());
+      frame_count = 0;
+      total_bytes = 0;
+      fps_timer = fr_end;
+    }
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     uint32_t avg_frame_time = ra_filter_run(&ra_filter, frame_time);
 #endif
@@ -428,14 +465,14 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
   if (s->id.PID == OV5640_PID || s->id.PID == OV3660_PID) {
     for (int reg = 0x3400; reg < 0x3406; reg += 2) {
-      p += print_reg(p, end, s, reg, 0xFFF);  //12 bit
+      p += print_reg(p, end, s, reg, 0xFFF);
     }
     p += print_reg(p, end, s, 0x3406, 0xFF);
 
-    p += print_reg(p, end, s, 0x3500, 0xFFFF0);  //16 bit
+    p += print_reg(p, end, s, 0x3500, 0xFFFF0);
     p += print_reg(p, end, s, 0x3503, 0xFF);
-    p += print_reg(p, end, s, 0x350a, 0x3FF);   //10 bit
-    p += print_reg(p, end, s, 0x350c, 0xFFFF);  //16 bit
+    p += print_reg(p, end, s, 0x350a, 0x3FF);
+    p += print_reg(p, end, s, 0x350c, 0xFFFF);
 
     for (int reg = 0x5480; reg <= 0x5490; reg++) {
       p += print_reg(p, end, s, reg, 0xFF);
@@ -448,7 +485,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     for (int reg = 0x5580; reg < 0x558a; reg++) {
       p += print_reg(p, end, s, reg, 0xFF);
     }
-    p += print_reg(p, end, s, 0x558a, 0x1FF);  //9 bit
+    p += print_reg(p, end, s, 0x558a, 0x1FF);
   } else if (s->id.PID == OV2640_PID) {
     p += print_reg(p, end, s, 0xd3, 0xFF);
     p += print_reg(p, end, s, 0x111, 0xFF);
@@ -492,6 +529,67 @@ static esp_err_t status_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json_response, strlen(json_response));
+}
+
+static esp_err_t sensor_handler(httpd_req_t *req) {
+  char json[128]; // Increased from 96 to 128 to comfortably fit the new key
+  // includes "alert" so the /live page (or any client) can reflect the
+  // most recent person-detection result without hitting a separate endpoint
+  // Also, includes "motion", a key the python script is querying this endpoint
+  // Once found, the python script runs on the next number frames, the number is
+  // deetermined by MotionFlagFramesRemaining
+  int len = snprintf(json, sizeof(json), "{\"temp\":%.1f,\"humidity\":%.1f,\"alert\":%d,\"motion\":%d}",
+                      latestTemp, latestHumidity, personAlertActive ? 1 : 0, hardwareMotionDetected ? 1 : 0);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json, len);
+}
+
+// /alert — hit by the Python detection script when a person is found.
+// Kept deliberately minimal: no JSON parsing, no computation, just flips
+// a flag and returns immediately. The httpd worker task that runs this
+// handler is shared infrastructure — anything slow or blocking in here
+// would delay every other request (including /stream) while it runs.
+static esp_err_t alert_handler(httpd_req_t *req) {
+  personAlertActive = true;
+  personAlertSetAt = millis();
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  static const char *resp = "OK";
+  return httpd_resp_send(req, resp, 2);
+}
+
+static esp_err_t live_handler(httpd_req_t *req) {
+  char html[1200];
+  int len = snprintf(html, sizeof(html),
+    "<!DOCTYPE html><html><head><style>"
+    "body{margin:0;background:#000;}"
+    ".wrap{position:relative;display:inline-block;}"
+    "img{display:block;width:100%%;}"
+    "#overlay{position:absolute;top:10px;left:10px;color:#0f0;"
+    "font-family:monospace;font-size:20px;background:rgba(0,0,0,0.5);"
+    "padding:6px 10px;border-radius:4px;}"
+    "#alert{position:absolute;top:10px;right:10px;color:#f00;"
+    "font-family:monospace;font-size:22px;font-weight:bold;"
+    "background:rgba(0,0,0,0.6);padding:6px 12px;border-radius:4px;"
+    "display:none;}"
+    "</style></head><body>"
+    "<div class=\"wrap\">"
+    "<img src=\"http://%s:81/stream\">"
+    "<div id=\"overlay\">--</div>"
+    "<div id=\"alert\">PERSON DETECTED</div>"
+    "</div>"
+    "<script>"
+    "function poll(){fetch('/sensor').then(r=>r.json()).then(d=>{"
+    "document.getElementById('overlay').innerText="
+    "'Temp: '+d.temp.toFixed(1)+'C  Hum: '+d.humidity.toFixed(1)+'%%';"
+    "document.getElementById('alert').style.display=d.alert?'block':'none';"
+    "});}"
+    "setInterval(poll,1000);poll();"
+    "</script></body></html>",
+    WiFi.localIP().toString().c_str());
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, html, len);
 }
 
 static esp_err_t xclk_handler(httpd_req_t *req) {
@@ -633,7 +731,7 @@ static esp_err_t win_handler(httpd_req_t *req) {
   int offsetX = parse_get_var(buf, "offx", 0);
   int offsetY = parse_get_var(buf, "offy", 0);
   int totalX = parse_get_var(buf, "tx", 0);
-  int totalY = parse_get_var(buf, "ty", 0);  // codespell:ignore totaly
+  int totalY = parse_get_var(buf, "ty", 0);
   int outputX = parse_get_var(buf, "ox", 0);
   int outputY = parse_get_var(buf, "oy", 0);
   bool scale = parse_get_var(buf, "scale", 0) == 1;
@@ -642,10 +740,10 @@ static esp_err_t win_handler(httpd_req_t *req) {
 
   log_i(
     "Set Window: Start: %d %d, End: %d %d, Offset: %d %d, Total: %d %d, Output: %d %d, Scale: %u, Binning: %u", startX, startY, endX, endY, offsetX, offsetY,
-    totalX, totalY, outputX, outputY, scale, binning  // codespell:ignore totaly
+    totalX, totalY, outputX, outputY, scale, binning
   );
   sensor_t *s = esp_camera_sensor_get();
-  int res = s->set_res_raw(s, startX, startY, endX, endY, offsetX, offsetY, totalX, totalY, outputX, outputY, scale, binning);  // codespell:ignore totaly
+  int res = s->set_res_raw(s, startX, startY, endX, endY, offsetX, offsetY, totalX, totalY, outputX, outputY, scale, binning);
   if (res) {
     return httpd_resp_send_500(req);
   }
@@ -682,10 +780,7 @@ void startCameraServer() {
     .handler = index_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -695,10 +790,7 @@ void startCameraServer() {
     .handler = status_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -708,10 +800,7 @@ void startCameraServer() {
     .handler = cmd_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -721,10 +810,7 @@ void startCameraServer() {
     .handler = capture_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -734,10 +820,39 @@ void startCameraServer() {
     .handler = stream_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
+#endif
+  };
+
+  httpd_uri_t sensor_uri = {
+    .uri = "/sensor",
+    .method = HTTP_GET,
+    .handler = sensor_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
+#endif
+  };
+
+  // New: /alert, hit by the Python person-detection script (GET request,
+  // no body needed — see alert_handler above for why it's kept this thin).
+  httpd_uri_t alert_uri = {
+    .uri = "/alert",
+    .method = HTTP_GET,
+    .handler = alert_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
+#endif
+  };
+
+  httpd_uri_t live_uri = {
+    .uri = "/live",
+    .method = HTTP_GET,
+    .handler = live_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -747,10 +862,7 @@ void startCameraServer() {
     .handler = bmp_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -760,10 +872,7 @@ void startCameraServer() {
     .handler = xclk_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -773,10 +882,7 @@ void startCameraServer() {
     .handler = reg_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -786,10 +892,7 @@ void startCameraServer() {
     .handler = greg_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -799,10 +902,7 @@ void startCameraServer() {
     .handler = pll_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -812,10 +912,7 @@ void startCameraServer() {
     .handler = win_handler,
     .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-    ,
-    .is_websocket = true,
-    .handle_ws_control_frames = false,
-    .supported_subprotocol = NULL
+    , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
   };
 
@@ -828,6 +925,9 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     httpd_register_uri_handler(camera_httpd, &bmp_uri);
+    httpd_register_uri_handler(camera_httpd, &sensor_uri);
+    httpd_register_uri_handler(camera_httpd, &alert_uri);
+    httpd_register_uri_handler(camera_httpd, &live_uri);
 
     httpd_register_uri_handler(camera_httpd, &xclk_uri);
     httpd_register_uri_handler(camera_httpd, &reg_uri);

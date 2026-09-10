@@ -1,17 +1,53 @@
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <Adafruit_NeoPixel.h>
 
 // ===========================
 // Select camera model in board_config.h
 // ===========================
 #include "board_config.h"
 
+#define NEOPIXEL_PIN 48
+#define NUM_PIXELS 1
+// ===========================
+// Config for external sensors
+// #define PIR_PIN 21
+// #define BUZZER_PIN 1
+// ===========================
 // ===========================
 // Enter your WiFi credentials
 // ===========================
 const char *ssid = "Brown's Desktop";
 const char *password = "12345678";
+
+float latestTemp = 0;
+float latestHumidity = 0;
+
+// Set by the /alert endpoint (app_httpd.cpp) when the Python detection
+// script reports a person. Cleared automatically after ALERT_DISPLAY_MS
+// — no timer/interrupt needed, just a millis() check in loop().
+volatile bool personAlertActive = false;
+volatile unsigned long personAlertSetAt = 0;
+const unsigned long ALERT_DISPLAY_MS = 5000;
+
+// Set to true when the ESP recieves the motion detected signal from the Arduino
+// records the time so that we can set it back to false after 3 seconds
+volatile bool hardwareMotionDetected = false;
+volatile unsigned long motionDetectedAt = 0;
+
+// Set by ESP when it receives temperature data from the Arduino
+// Flashes the Neopixel green to show the ESP is receiving data
+// Cleared automatically after MESSAGE_RECEIVED_FLASH_MS
+bool messageReceived = false;
+unsigned long messageReceivedAt = 0;
+const unsigned long MESSAGE_RECEIVED_FLASH_MS = 100; 
+
+Adafruit_NeoPixel pixel(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+HardwareSerial ArduinoLink(0);
+
+// Global variable for the number of frames to flag when motion is sensed
+extern volatile int MotionFlagFramesRemaining;
 
 void startCameraServer();
 void setupLedFlash();
@@ -49,16 +85,20 @@ void setup() {
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
+  // if PSRAM IC present, init with higher-res frame buffer available,
+  // but actually STREAM at VGA — the realistic target for 30fps over WiFi.
+  // (SVGA/UXGA are too many bytes/frame to hit 30fps reliably — test VGA
+  // first, only push higher if FPS log shows headroom.)
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
-      config.jpeg_quality = 10;
+      config.frame_size = FRAMESIZE_QVGA;   // 320x240 — start here, not VGA
+      config.jpeg_quality = 12;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
+      config.xclk_freq_hz = 20000000;      // full clock — was dropped to 15MHz before, no reason to underclock on this board
     } else {
       // Limit the frame size when PSRAM is not available
-      config.frame_size = FRAMESIZE_SVGA;
+      config.frame_size = FRAMESIZE_VGA;
       config.fb_location = CAMERA_FB_IN_DRAM;
     }
   } else {
@@ -86,12 +126,17 @@ void setup() {
   if (s->id.PID == OV3660_PID) {
     s->set_vflip(s, 1);        // flip it back
     s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
+    s->set_saturation(s, 2);  // lower the saturation
   }
-  // drop down frame size for higher initial frame rate
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-  }
+  // NOTE: removed the old "s->set_framesize(s, FRAMESIZE_QVGA);" line that
+  // used to run here — it was silently overriding the config above back
+  // down to 320x240 on every boot. That was your 240p ceiling. Don't
+  // re-add a framesize override here unless you mean it.
+
+  // Force VGA explicitly, every boot, so the web UI's control panel (or
+  // anyone hitting "/") can't silently override it to something else the
+  // way it just did (jumped to XGA/1024x768 and tanked fps to ~2-6).
+  s->set_framesize(s, FRAMESIZE_QVGA);
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
   s->set_vflip(s, 1);
@@ -119,6 +164,11 @@ void setup() {
   Serial.println("WiFi connected");
 
   startCameraServer();
+  ArduinoLink.begin(9600, SERIAL_8N1, 1, 21); // RX=GPIO1 (actually used); TX=GPIO21 (unused direction — not the onboard LED pin, not a boot-strapping pin, just parked here since something has to be specified)
+  Serial.println("Waiting for Arduino data...");
+  pixel.begin();
+  pixel.setBrightness(50);
+  pixel.show();
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
@@ -126,6 +176,76 @@ void setup() {
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  static String buffer = "";
+  while (ArduinoLink.available()) {
+    char c = ArduinoLink.read();
+    if (c == '\n') {
+      parseLine(buffer);
+      buffer = "";
+    } else if (c != '\r') {
+      buffer += c;
+    }
+  }
+
+  // ====================================
+  // CORE LOGIC: Motion State Management
+  // ====================================
+  // Clear the motion flag after 3 seconds so that /sensor JSON
+  // resets and the python script goes back to sleep
+  if (hardwareMotionDetected && (millis() - motionDetectedAt > 3000)) {
+    hardwareMotionDetected = false;
+  }
+
+  // ==========================================
+  // UI LOGIC: Unified Non-blocking LED state machine
+  // ==========================================
+static bool pixelShowingAlert = false;
+
+  if (personAlertActive) {
+    // Priority 1: Red Alert
+    if (!pixelShowingAlert || pixel.getPixelColor(0) != pixel.Color(255, 0, 0)) {
+      pixel.setPixelColor(0, pixel.Color(255, 0, 0));  
+      pixel.show();
+      pixelShowingAlert = true;
+    }
+    if (millis() - personAlertSetAt > ALERT_DISPLAY_MS) {
+      personAlertActive = false;
+    }
+  } 
+  else if (messageReceived) {
+    // Priority 2: Green Temperature Update
+    if (!pixelShowingAlert || pixel.getPixelColor(0) != pixel.Color(0, 255, 0)) {
+      pixel.setPixelColor(0, pixel.Color(0, 255, 0));  
+      pixel.show();
+      pixelShowingAlert = true;
+    }
+    if (millis() - messageReceivedAt > MESSAGE_RECEIVED_FLASH_MS) {
+      messageReceived = false;
+    }
+  } 
+  else if (pixelShowingAlert) {
+    // Default: Turn off if no flags are active
+    pixel.setPixelColor(0, pixel.Color(0, 0, 0));  
+    pixel.show();
+    pixelShowingAlert = false;
+  }
+}
+
+void parseLine(String line) {
+  int hIndex = line.indexOf(",H:");
+  if (line.startsWith("T:") && hIndex > 0) {
+    latestTemp = line.substring(2, hIndex).toFloat();
+    latestHumidity = line.substring(hIndex + 3).toFloat();
+
+    messageReceived = true;
+    messageReceivedAt = millis();
+
+  } else if (line.startsWith("M:1")) {
+    // PIR motion from Arduino — flag the next several frames in the
+    // stream with X-Motion: 1 (stream_handler in app_httpd.cpp already
+    // reads MotionFlagFramesRemaining and decrements it per frame sent)
+    hardwareMotionDetected = true;
+    motionDetectedAt = millis();
+    MotionFlagFramesRemaining = 30; // ~1s of frames at current fps, tune as needed
+  }
 }
