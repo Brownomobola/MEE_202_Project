@@ -18,8 +18,8 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "Brown's Desktop";
-const char *password = "12345678";
+const char *ssid = "***";
+const char *password = "***";
 
 float latestTemp = 0;
 float latestHumidity = 0;
