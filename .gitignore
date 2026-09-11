@@ -4,3 +4,6 @@
 *.csv
 *.yml.old
 *.csv.old
+detections
+MEE202_CamOverSerial1
+testing.py

@@ -16,7 +16,7 @@ const unsigned long interval = 2000;
 // with PIR interrupt timing or slow down the main loop.
 const unsigned long LED_FLASH_MS = 300;
 volatile unsigned long lastTriggerTime = 0;
-const unsigned long DEBOUNCE_MS = 1000;
+const unsigned long DEBOUNCE_MS = 3000;
 unsigned long lastLedFlash = 0;
 
 void flashLed() {

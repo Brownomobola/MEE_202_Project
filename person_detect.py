@@ -11,8 +11,8 @@ read off the port -- if it were, the incoming stream would back up and
 this script would fall further and further behind live video.
 
 Usage:
-    pip install pyserial opencv-python ultralytics requests python-dotenv
-    python person_detect_3.py
+    pip install -r requirements.txt
+    python person_detect.py
 """
 
 import os
@@ -69,6 +69,9 @@ frame_counter = 0           # Incremented on every new frame. Lets the burst
                             # new, never the same one counted twice.
 motion_queue = queue.Queue()
 stop_event = threading.Event()
+burst_lock = threading.Lock()
+burst_in_progress = False
+detection_display_queue = queue.Queue()
 
 
 def serial_reader(ser):
@@ -120,6 +123,7 @@ def serial_reader(ser):
                 if len(buffer) >= idx + 4 + 4:
                     length_bytes = buffer[idx + 4 : idx + 8]
                     frame_len = int.from_bytes(length_bytes, "little")
+
                     
                     # Check if the full JPEG payload has arrived yet
                     total_packet_size = idx + 8 + frame_len
@@ -147,6 +151,14 @@ def serial_reader(ser):
             # If we don't have enough data to complete a packet, break and wait for more chunks
             break
 
+def burst_worker(model, start_counter):
+    global burst_in_progress
+    found, frame = run_detection_burst(model, start_counter)
+    if found:
+        maybe_send_alert(frame)
+        detection_display_queue.put(frame)
+    with burst_lock:
+        burst_in_progress = False
 
 def get_new_frame(since_counter, timeout=2.0):
     """Blocks until a frame newer than `since_counter` has arrived, or gives
@@ -233,8 +245,6 @@ def run_detection_burst(model, start_counter):
         print(f"  frame {i + 1}/{BURST_FRAME_COUNT}: {'PERSON DETECTED' if found else 'no person'}")
 
         if found:
-            cv2.imshow("Detection", annotated)
-            cv2.waitKey(1)
             return True, annotated
 
     return False, None
@@ -242,7 +252,8 @@ def run_detection_burst(model, start_counter):
 
 def main():
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    global _serial_conn; _serial_conn = ser
+    global _serial_conn, burst_in_progress
+    _serial_conn = ser
     reader_thread = threading.Thread(target=serial_reader, args=(ser,), daemon=True)
     reader_thread.start()
 
@@ -290,6 +301,14 @@ def main():
                 
             cv2.waitKey(1)
 
+                        # Show any detection result that finished in the background,
+            # without ever blocking the live feed to wait for one.
+            try:
+                detection_frame = detection_display_queue.get_nowait()
+                cv2.imshow("Detection", detection_frame)
+            except queue.Empty:
+                pass
+
             try:
                 motion_time = motion_queue.get_nowait()
             except queue.Empty:
@@ -301,14 +320,18 @@ def main():
                 print("Motion seen, but still in cooldown -- ignoring.")
                 continue
 
+            with burst_lock:
+                if burst_in_progress:
+                    print("Motion seen, but a burst is already running -- ignoring.")
+                    continue
+                burst_in_progress = True
+
             last_motion_handled = motion_time
             with frame_lock:
                 start_counter = frame_counter
 
             print("Motion detected -- running burst check...")
-            found, frame = run_detection_burst(model, start_counter)
-            if found:
-                maybe_send_alert(frame)
+            threading.Thread(target=burst_worker, args=(model, start_counter), daemon=True).start()
 
     finally:
         stop_event.set()
