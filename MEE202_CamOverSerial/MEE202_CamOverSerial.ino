@@ -1,3 +1,6 @@
+// Ensure that PSRAM is enabled and the partition is set properly
+// Also make sure to enable USB CDC on boot in the Tools menu in Arduino IDE
+
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <Adafruit_NeoPixel.h>
