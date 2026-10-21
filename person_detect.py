@@ -28,7 +28,7 @@ import serial
 from ultralytics import YOLO
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Configuration ---------------------------------------------------
 
@@ -204,6 +204,8 @@ def _send_telegram_worker(image_path):
             files = {"photo": image_file}
             data = {"chat_id": TELEGRAM_BOT_ID, "caption": "Alert: Person Detected!"}
             resp = requests.post(url, data, files=files, timeout=15)
+            if not resp.ok:
+                print(f"Telegram API error details: {resp.text}")
             resp.raise_for_status()
         print("Telegram alert sent successfully")
     except Exception as e:
